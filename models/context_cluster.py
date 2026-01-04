@@ -58,9 +58,18 @@ default_cfgs = {
 
 class PointRecuder(nn.Module):
     """
-    Point Reducer is implemented by a layer of conv since it is mathmatically equal.
-    Input: tensor in shape [B, in_chans, H, W]
-    Output: tensor in shape [B, embed_dim, H/stride, W/stride]
+    点降采样器 - 本质上等价于卷积操作的Patch Embedding
+    
+    作用:
+    - 将输入特征图进行降采样，减少点的数量
+    - 同时改变通道维度
+    
+    数学等价性:
+    - 对于规则网格上的点，通过步长卷积进行降采样
+    - 数学上等价于对点集进行区域聚合
+    
+    Input:  [B, in_chans, H, W]
+    Output: [B, embed_dim, H/stride, W/stride]
     """
 
     def __init__(self, patch_size=16, stride=16, padding=0,
@@ -81,8 +90,14 @@ class PointRecuder(nn.Module):
 
 class GroupNorm(nn.GroupNorm):
     """
-    Group Normalization with 1 group.
-    Input: tensor in shape [B, C, H, W]
+    使用1个组的GroupNorm，等价于LayerNorm在空间维度上的应用
+    
+    为什么用GroupNorm而不是BatchNorm?
+    - BatchNorm对batch size敏感，小batch效果差
+    - GroupNorm与batch size无关，更稳定
+    - 1个组的GroupNorm = LayerNorm (对每个样本的所有通道归一化)
+    
+    Input: [B, C, H, W]
     """
 
     def __init__(self, num_channels, **kwargs):
@@ -91,10 +106,18 @@ class GroupNorm(nn.GroupNorm):
 
 def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     """
-    return pair-wise similarity matrix between two tensors
-    :param x1: [B,...,M,D]
-    :param x2: [B,...,N,D]
-    :return: similarity matrix [B,...,M,N]
+    计算两个张量之间的成对余弦相似度矩阵
+    
+    余弦相似度公式: cos(a,b) = (a·b) / (||a|| × ||b||)
+    
+    Args:
+        x1: [B, ..., M, D]  M个D维向量
+        x2: [B, ..., N, D]  N个D维向量
+    
+    Returns:
+        sim: [B, ..., M, N]  相似度矩阵，sim[i,j]表示x1[i]和x2[j]的相似度
+    
+    用途: 计算聚类中心与各点之间的相似度
     """
     x1 = F.normalize(x1, dim=-1)
     x2 = F.normalize(x2, dim=-1)
@@ -102,7 +125,7 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     sim = torch.matmul(x1, x2.transpose(-2, -1))
     return sim
 
-
+# region Cluster模块
 class Cluster(nn.Module):
     def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24,
                  return_center=False):
@@ -117,25 +140,77 @@ class Cluster(nn.Module):
         :param heads:  heads number in context cluster
         :param head_dim: dimension of each head in context cluster
         :param return_center: if just return centers instead of dispatching back (deprecated).
+            
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                        Cluster 模块工作流程                              │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                                                                         │
+    │  1. 特征提取:                                                           │
+    │     x ──┬──► f(x) ──► 用于计算相似度的特征                              │
+    │         └──► v(x) ──► 用于聚合的value特征                               │
+    │                                                                         │
+    │  2. 生成聚类中心 (Context Cluster Centers):                             │
+    │     使用 AdaptiveAvgPool2d 从特征图中生成 M 个候选中心                   │
+    │     centers = AvgPool(f(x))  # [B, C, proposal_h, proposal_w]           │
+    │                                                                         │
+    │  3. 计算相似度:                                                         │
+    │     sim = sigmoid(α * cos_sim(centers, points) + β)                     │
+    │     - α, β 是可学习参数                                                 │
+    │     - 每个点找到最相似的中心 (hard assignment)                          │
+    │                                                                         │
+    │  4. 聚合 (Aggregate):                                                   │
+    │     center_features = Σ(sim * value) / Σ(sim)                           │
+    │     将属于同一中心的点的value加权求和                                    │
+    │                                                                         │
+    │  5. 分发 (Dispatch):                                                    │
+    │     output = Σ(sim * center_features)                                   │
+    │     将聚合后的中心特征分发回各个点                                       │
+    │                                                                         │
+    └─────────────────────────────────────────────────────────────────────────┘
         """
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
+
+        # f: 用于计算相似度的投影
         self.f = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for similarity
-        self.proj = nn.Conv2d(heads * head_dim, out_dim, kernel_size=1)  # for projecting channel number
+        # v: 用于聚合的value投影
         self.v = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for value
+        # proj: 输出投影，将多头合并后投影到out_dim
+        self.proj = nn.Conv2d(heads * head_dim, out_dim, kernel_size=1)  # for projecting channel number
+
+        # 可学习的相似度缩放参数
+        # sim = sigmoid(α * cos_sim + β)
         self.sim_alpha = nn.Parameter(torch.ones(1))
         self.sim_beta = nn.Parameter(torch.zeros(1))
+
+        # 通过自适应平均池化生成中心
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
+        
+        # 区域划分参数
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.return_center = return_center
 
     def forward(self, x):  # [b,c,w,h]
+        """
+        Args:
+            x: [B, C, W, H] 输入特征图
+        
+        Returns:
+            out: [B, out_dim, W, H] 输出特征图
+        """
+        # ========== Step 1: 特征投影 ==========
         value = self.v(x)
         x = self.f(x)
+
+        # 拆分多头: [B, heads*head_dim, W, H] -> [B*heads, head_dim, W, H]
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
+
+        # ========== Step 2: 区域划分 (可选) ==========
+        # 将大特征图分成多个小区域，在每个区域内独立聚类
+        # 目的: 减少计算量，同时保持局部性
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -145,9 +220,19 @@ class Cluster(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         b, c, w, h = x.shape
+
+        # ========== Step 3: 生成聚类中心 ==========
+        # [B, C, proposal_w, proposal_h] → proposal_w * proposal_h 个中心
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
+        
         b, c, ww, hh = centers.shape
+
+        # ========== Step 4: 计算相似度 ==========
+        # 计算第 M 个中心与第 N 个点的相似度得分
+        # pairwise_cos_sim: 余弦相似度，取值范围 [-1, 1]
+        # self.sim_alpha * sim + self.sim_beta: 可学习的仿射变换(偏移因子 + 缩放因子)
+        # torch.sigmoid 将相似度归一化到 [0, 1]
         sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
@@ -155,35 +240,74 @@ class Cluster(nn.Module):
                 x.reshape(b, c, -1).permute(0, 2, 1)
             )
         )  # [B,M,N]
-        # we use mask to sololy assign each point to one center
+
+        # ========== Step 5: Hard Assignment (硬分配) ==========
+        # 找到每个点最相似的中心
+        # 每个点 n 沿着 dim=1（聚类中心维度 M）求最大值
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+
+        # 创建 One-Hot 掩码
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        # 最大位置填 1
+        # dim=1：沿着「聚类中心维度 M」进行填充 → 和之前 max 的 dim=1 严格一致，必须对齐
+        # index=sim_max_idx：填充的「位置索引」，形状 [B,1,N] → 每个特征点 n 对应的最优中心的索引 m
+        # value=1.0：填充的「数值」→ 在最优中心的位置填 1，其余位置保持 0
         mask.scatter_(1, sim_max_idx, 1.)
+
+        # 利用广播乘法实现最终的筛选，只保留最大相似度
         sim = sim * mask
+
+        # ========== Step 6: 聚合 (Aggregate) ==========
+        # 将每个中心管辖的点的value加权求和
+        # value: [B, C, w, h] -> [B, N, C]
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
+
         # aggregate step, out shape [B,M,D]
+        # 聚合公式: center_out = (Σ sim * value + value_centers) / (Σ sim + 1)
+        # value2.unsqueeze(1): [B, 1, N, D]
+        # sim.unsqueeze(-1): [B, M, N, 1]
+        # 相乘: [B, M, N, D]
+        # sum(dim=2): [B, M, D]
         out = ((value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2) + value_centers) / (
                     sim.sum(dim=-1, keepdim=True) + 1.0)  # [B,M,D]
+        # 加1.0防止除零，同时起到残差连接的作用
 
+        # ========== Step 7: 分发 (Dispatch) ==========
         if self.return_center:
+            # 只返回中心特征 (deprecated)
             out = rearrange(out, "b (w h) c -> b c w h", w=ww)
         else:
-            # dispatch step, return to each point in a cluster
+            # 将中心特征分发回每个点
+            # out: [B, M, D], sim: [B, M, N]
+            # out.unsqueeze(2): [B, M, 1, D]
+            # sim.unsqueeze(-1): [B, M, N, 1]
+            # 相乘求和: [B, N, D]
             out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
             out = rearrange(out, "b (w h) c -> b c w h", w=w)
 
+        # ========== Step 8: 恢复区域划分 ==========
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+        
+        # ========== Step 9: 合并多头 ==========
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
         return out
+# endregion
 
 
 class Mlp(nn.Module):
     """
-    Implementation of MLP with nn.Linear (would be slightly faster in both training and inference).
-    Input: tensor with shape [B, C, H, W]
+    MLP模块 - 使用nn.Linear实现
+    
+    结构: Linear -> GELU -> Dropout -> Linear -> Dropout
+    
+    在ViT/MetaFormer中的作用:
+    - Token Mixer (Cluster) 负责空间信息交互
+    - MLP 负责通道维度的特征变换
+    
+    Input: [B, C, H, W]
     """
 
     def __init__(self, in_features, hidden_features=None,
@@ -212,6 +336,7 @@ class Mlp(nn.Module):
         return x
 
 
+# region ClusterBlock
 class ClusterBlock(nn.Module):
     """
     Implementation of one block.
@@ -224,6 +349,40 @@ class ClusterBlock(nn.Module):
         refer to https://arxiv.org/abs/1603.09382
     --use_layer_scale, --layer_scale_init_value: LayerScale,
         refer to https://arxiv.org/abs/2103.17239
+
+    结构:
+    ┌─────────────────────────────────────────────┐
+    │  x ─────────────────────┐                   │
+    │  │                      │                   │
+    │  ↓                      │                   │
+    │  Norm1                  │                   │
+    │  ↓                      │                   │
+    │  Cluster (Token Mixer)  │                   │
+    │  ↓                      │                   │
+    │  LayerScale             │                   │
+    │  ↓                      │                   │
+    │  DropPath               │                   │
+    │  ↓                      │                   │
+    │  + ←────────────────────┘  (残差连接)       │
+    │  │                                          │
+    │  ↓ ─────────────────────┐                   │
+    │  Norm2                  │                   │
+    │  ↓                      │                   │
+    │  MLP (Channel Mixer)    │                   │
+    │  ↓                      │                   │
+    │  LayerScale             │                   │
+    │  ↓                      │                   │
+    │  DropPath               │                   │
+    │  ↓                      │                   │
+    │  + ←────────────────────┘  (残差连接)       │
+    │  │                                          │
+    │  ↓                                          │
+    │  output                                     │
+    └─────────────────────────────────────────────┘
+    
+    技术要点:
+    - DropPath (Stochastic Depth): 训练时随机丢弃整个块，增强泛化
+    - LayerScale: 对每个块的输出进行可学习缩放，稳定深层网络训练
     """
 
     def __init__(self, dim, mlp_ratio=4.,
@@ -248,6 +407,7 @@ class ClusterBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.use_layer_scale = use_layer_scale
         if use_layer_scale:
+            # 初始化为极小值，让深层网络初期接近恒等映射，稳定训练
             self.layer_scale_1 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
             self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
@@ -287,8 +447,10 @@ def basic_blocks(dim, index, layers,
     blocks = nn.Sequential(*blocks)
 
     return blocks
+# endregion
 
 
+# region ContextCluster
 class ContextCluster(nn.Module):
     """
     ContextCluster, the main class of our model
@@ -304,6 +466,45 @@ class ContextCluster(nn.Module):
     --fork_feat: whether output features of the 4 stages, for dense prediction
     --init_cfg, --pretrained:
         for mmdetection and mmsegmentation to load pretrained weights
+
+    整体结构:
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │                                                                        │
+    │  Input: [B, 3, 224, 224]                                              │
+    │         ↓                                                              │
+    │  Position Encoding: 添加2D位置坐标 → [B, 5, 224, 224]                  │
+    │         ↓                                                              │
+    │  Patch Embedding: stride=4 → [B, embed_dims[0], 56, 56]               │
+    │         ↓                                                              │
+    │  ┌──────────────────────────────────────────────────────────────────┐ │
+    │  │ Stage 1: ClusterBlocks × layers[0]                               │ │
+    │  │ 分辨率: 56×56, 通道: embed_dims[0]                                │ │
+    │  │ fold: 8×8 (分成64个区域)                                          │ │
+    │  └──────────────────────────────────────────────────────────────────┘ │
+    │         ↓ PointReducer (downsample)                                    │
+    │  ┌──────────────────────────────────────────────────────────────────┐ │
+    │  │ Stage 2: ClusterBlocks × layers[1]                               │ │
+    │  │ 分辨率: 28×28, 通道: embed_dims[1]                                │ │
+    │  │ fold: 4×4 (分成16个区域)                                          │ │
+    │  └──────────────────────────────────────────────────────────────────┘ │
+    │         ↓ PointReducer (downsample)                                    │
+    │  ┌──────────────────────────────────────────────────────────────────┐ │
+    │  │ Stage 3: ClusterBlocks × layers[2]                               │ │
+    │  │ 分辨率: 14×14, 通道: embed_dims[2]                                │ │
+    │  │ fold: 2×2 (分成4个区域)                                           │ │
+    │  └──────────────────────────────────────────────────────────────────┘ │
+    │         ↓ PointReducer (downsample)                                    │
+    │  ┌──────────────────────────────────────────────────────────────────┐ │
+    │  │ Stage 4: ClusterBlocks × layers[3]                               │ │
+    │  │ 分辨率: 7×7, 通道: embed_dims[3]                                  │ │
+    │  │ fold: 1×1 (全局聚类)                                              │ │
+    │  └──────────────────────────────────────────────────────────────────┘ │
+    │         ↓                                                              │
+    │  Global Average Pooling → [B, embed_dims[3]]                          │
+    │         ↓                                                              │
+    │  Classification Head → [B, num_classes]                               │
+    │                                                                        │
+    └────────────────────────────────────────────────────────────────────────┘
     """
 
     def __init__(self, layers, embed_dims=None,
@@ -442,23 +643,47 @@ class ContextCluster(nn.Module):
             self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_embeddings(self, x):
+        """
+        位置编码
+
+        聚类操作是置换不变的（点的顺序不影响结果）
+        需要显式高数模型每个点的空间位置
+        """
         _, c, img_w, img_h = x.shape
         # print(f"det img size is {img_w} * {img_h}")
         # register positional information buffer.
+
+        # 生成归一化坐标 [0, 1]
         range_w = torch.arange(0, img_w, step=1) / (img_w - 1.0)
         range_h = torch.arange(0, img_h, step=1) / (img_h - 1.0)
+
+        # 创建 2D 网格并中心化 [-0.5, 0.5]
         fea_pos = torch.stack(torch.meshgrid(range_w, range_h, indexing='ij'), dim=-1).float()
         fea_pos = fea_pos.to(x.device)
         fea_pos = fea_pos - 0.5
         pos = fea_pos.permute(2, 0, 1).unsqueeze(dim=0).expand(x.shape[0], -1, -1, -1)
+        
+        # 与RGB拼接: [B,3,H,W] + [B,2,H,W] → [B,5,H,W]
+        # 通过 patch embedding 转换为 [B, embed_dims[0], H / 4, W / 4]
         x = self.patch_embed(torch.cat([x, pos], dim=1))
         return x
 
     def forward_tokens(self, x):
+        """
+        前向传播: 通过所有stages
+        
+        Args:
+            x: [B, C, H, W] 嵌入特征
+        
+        Returns:
+            fork_feat=True: 4个stage的特征列表 (用于检测/分割)
+            fork_feat=False: 最终特征 [B, C, H, W]
+        """
         outs = []
         for idx, block in enumerate(self.network):
             x = block(x)
             if self.fork_feat and idx in self.out_indices:
+                # 收集各stage输出
                 norm_layer = getattr(self, f'norm{idx}')
                 x_out = norm_layer(x)
                 outs.append(x_out)
@@ -469,19 +694,34 @@ class ContextCluster(nn.Module):
         return x
 
     def forward(self, x):
-        # input embedding
+        """
+        完整前向传播
+        
+        Args:
+            x: [B, 3, H, W] 输入图像
+        
+        Returns:
+            fork_feat=True: [feat1, feat2, feat3, feat4] 多尺度特征
+            fork_feat=False: [B, num_classes] 分类logits
+        """
+        # Step 1: 位置编码 + Patch Embedding
         x = self.forward_embeddings(x)
-        # through backbone
+        # Step 2: 通过backbone
         x = self.forward_tokens(x)
         if self.fork_feat:
-            # otuput features of four stages for dense prediction
+            # 密集预测: 返回多尺度特征
             return x
+        
+        # Step 3: 分类
         x = self.norm(x)
+        # 全局平均池化: [B, C, H, W] -> [B, C]
         cls_out = self.head(x.mean([-2, -1]))
         # for image classification
         return cls_out
+# endregion
 
 
+# region 模型配置函数
 @register_model
 def coc_tiny(pretrained=False, **kwargs):
     layers = [3, 4, 5, 2]
@@ -830,7 +1070,7 @@ if has_mmdet:
                     heads=heads, head_dim=head_dim,
                     fork_feat=True,
                     **kwargs)
-
+# endregion
 
 if __name__ == '__main__':
     input = torch.rand(2, 3, 224, 224)
